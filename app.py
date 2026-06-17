@@ -2,8 +2,10 @@ import io
 import json
 from pathlib import Path
 
+import gspread
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
 
 from review_generator import generate_reviews_for_sku, ALL_COLUMNS
 
@@ -11,6 +13,13 @@ BASE_DIR = Path(__file__).parent
 POSITIVE_FILE = BASE_DIR / "리뷰작업_긍정리뷰.xlsx"
 NEGATIVE_FILE = BASE_DIR / "리뷰작업_부정리뷰.xlsx"
 PRODUCTS_FILE = BASE_DIR / "products.json"
+
+# 직접 추가한 상품(custom_products)의 영구 저장소.
+# Streamlit Cloud의 로컬 파일은 재배포 시 초기화되므로, 여기서 새로 추가한
+# 상품이 사라지지 않도록 Google Sheets에 저장한다.
+PRODUCTS_SHEET_ID = "1E8Jkkd7Ol8Yeh2o4aLTNdfhoFCKyz-1ufhW4KF7yaBo"
+PRODUCTS_SHEET_GID = 117185975
+SHEET_KEYWORD_COLS = 6  # 소구키워드1~6
 
 
 @st.cache_data
@@ -24,19 +33,75 @@ def load_excel(path: Path) -> pd.DataFrame:
     return data.reset_index(drop=True)
 
 
+@st.cache_resource
+def get_products_sheet():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(PRODUCTS_SHEET_ID)
+    return next(w for w in spreadsheet.worksheets() if w.id == PRODUCTS_SHEET_GID)
+
+
+def load_custom_products_from_sheet() -> list:
+    rows = get_products_sheet().get_all_values()[1:]  # 1행은 헤더
+    products = []
+    for row in rows:
+        if len(row) < 2 or not row[0].strip():
+            continue
+        keywords = [v.strip() for v in row[2:2 + SHEET_KEYWORD_COLS] if v.strip()]
+        products.append({
+            "product_id": row[0].strip(),
+            "product_title": row[1].strip(),
+            "appeal_points": ", ".join(keywords),
+        })
+    return products
+
+
+def _find_sheet_row(pid: str):
+    ids = get_products_sheet().col_values(1)
+    for i, v in enumerate(ids[1:], start=2):  # 2행부터 (1행은 헤더)
+        if v.strip() == pid:
+            return i
+    return None
+
+
+def append_product_to_sheet(pid: str, title: str, appeal: str):
+    get_products_sheet().append_row([pid, title, appeal], value_input_option="RAW")
+
+
+def update_appeal_points_in_sheet(pid: str, appeal: str):
+    row = _find_sheet_row(pid)
+    if row:
+        get_products_sheet().update(
+            range_name=f"C{row}:H{row}",
+            values=[[appeal, "", "", "", "", ""]],
+            value_input_option="RAW",
+        )
+
+
+def delete_product_from_sheet(pid: str):
+    row = _find_sheet_row(pid)
+    if row:
+        get_products_sheet().delete_rows(row)
+
+
 def load_products() -> dict:
     if PRODUCTS_FILE.exists():
         with open(PRODUCTS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    data = {"appeal_points": {}, "custom_products": [], "hidden_skus": []}
-    for path in [POSITIVE_FILE, NEGATIVE_FILE]:
-        if path.exists():
-            df = load_excel(path)
-            for _, row in df.drop_duplicates("product_id").iterrows():
-                pid = str(row["product_id"])
-                if pid not in data["appeal_points"]:
-                    data["appeal_points"][pid] = ""
-    save_products(data)
+            data = json.load(f)
+    else:
+        data = {"appeal_points": {}, "custom_products": [], "hidden_skus": []}
+        for path in [POSITIVE_FILE, NEGATIVE_FILE]:
+            if path.exists():
+                df = load_excel(path)
+                for _, row in df.drop_duplicates("product_id").iterrows():
+                    pid = str(row["product_id"])
+                    if pid not in data["appeal_points"]:
+                        data["appeal_points"][pid] = ""
+        save_products(data)
+    data["custom_products"] = load_custom_products_from_sheet()
     return data
 
 
@@ -551,22 +616,25 @@ with st.expander("🗂️ 상품 관리 (추가·삭제·소구 포인트 편집
                 if new_ap != appeal:
                     if source == "excel":
                         products_data["appeal_points"][pid] = new_ap
+                        save_products(products_data)
                     else:
+                        update_appeal_points_in_sheet(pid, new_ap)
                         for cp in products_data["custom_products"]:
                             if cp["product_id"] == pid:
                                 cp["appeal_points"] = new_ap
-                    save_products(products_data)
+                    st.session_state.products_data = products_data
             with col_del:
                 if st.button("🗑️", key=f"del_{pid}", help="삭제"):
                     if source == "excel":
                         if pid not in products_data["hidden_skus"]:
                             products_data["hidden_skus"].append(pid)
+                        save_products(products_data)
                     else:
+                        delete_product_from_sheet(pid)
                         products_data["custom_products"] = [
                             cp for cp in products_data["custom_products"]
                             if cp["product_id"] != pid
                         ]
-                    save_products(products_data)
                     st.session_state.products_data = products_data
                     st.rerun()
 
@@ -591,12 +659,12 @@ with st.expander("🗂️ 상품 관리 (추가·삭제·소구 포인트 편집
             if new_pid in existing_ids:
                 st.warning("이미 등록된 상품 ID입니다.")
             else:
+                append_product_to_sheet(new_pid, new_title, new_ap)
                 products_data["custom_products"].append({
                     "product_id": new_pid,
                     "product_title": new_title,
                     "appeal_points": new_ap,
                 })
-                save_products(products_data)
                 st.session_state.products_data = products_data
                 st.success(f"「{new_title}」을 추가했습니다.")
                 st.rerun()
